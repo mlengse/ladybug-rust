@@ -16,6 +16,8 @@ pub enum ConversionError {
     TimestampMs(i64),
     TimestampSec(i64),
     Json(String, serde_json::Error),
+    /// An unsupported type was encountered during FFI conversion
+    UnsupportedType(String),
 }
 
 impl std::fmt::Display for ConversionError {
@@ -27,7 +29,7 @@ impl std::fmt::Display for ConversionError {
 impl std::fmt::Debug for ConversionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use ConversionError::{
-            Date, Json, Timestamp, TimestampMs, TimestampNs, TimestampSec, TimestampTz,
+            Date, Json, Timestamp, TimestampMs, TimestampNs, TimestampSec, TimestampTz, UnsupportedType,
         };
         match self {
             Date(days) => write!(f, "Could not convert Lbug date offset of UNIX_EPOCH + {days} days to time::Date"),
@@ -37,6 +39,7 @@ impl std::fmt::Debug for ConversionError {
             TimestampMs(ms) => write!(f, "Could not convert Lbug timestamp_ms offset of UNIX_EPOCH + {ms} milliseconds to time::OffsetDateTime"),
             TimestampSec(sec) => write!(f, "Could not convert Lbug timestamp_sec offset of UNIX_EPOCH + {sec} seconds to time::OffsetDateTime"),
             Json(value, err) => write!(f, "Could not convert Lbug JSON value {value:?}: {err}"),
+            UnsupportedType(typ) => write!(f, "Unsupported type during FFI value conversion: {typ}"),
         }
     }
 }
@@ -270,6 +273,91 @@ pub enum Value {
     },
     UUID(uuid::Uuid),
     Decimal(rust_decimal::Decimal),
+}
+
+/// Checks whether a `Value` variant is compatible with a given `LogicalType`.
+///
+/// Returns `true` if the value's runtime type matches the declared logical type.
+fn value_matches_logical_type(value: &Value, logical_type: &LogicalType) -> bool {
+    use LogicalType as LT;
+    use Value as V;
+    match (logical_type, value) {
+        // Exact matches for simple types
+        (LT::Any, V::Null(_)) => true,
+        (LT::Bool, V::Bool(_)) => true,
+        (LT::Int64, V::Int64(_)) => true,
+        (LT::Int32, V::Int32(_)) => true,
+        (LT::Int16, V::Int16(_)) => true,
+        (LT::Int8, V::Int8(_)) => true,
+        (LT::UInt64, V::UInt64(_)) => true,
+        (LT::UInt32, V::UInt32(_)) => true,
+        (LT::UInt16, V::UInt16(_)) => true,
+        (LT::UInt8, V::UInt8(_)) => true,
+        (LT::Int128, V::Int128(_)) => true,
+        (LT::Double, V::Double(_)) => true,
+        (LT::Float, V::Float(_)) => true,
+        (LT::Date, V::Date(_)) => true,
+        (LT::Interval, V::Interval(_)) => true,
+        (LT::Timestamp, V::Timestamp(_)) => true,
+        (LT::TimestampTz, V::TimestampTz(_)) => true,
+        (LT::TimestampNs, V::TimestampNs(_)) => true,
+        (LT::TimestampMs, V::TimestampMs(_)) => true,
+        (LT::TimestampSec, V::TimestampSec(_)) => true,
+        (LT::InternalID, V::InternalID(_)) => true,
+        (LT::String, V::String(_)) => true,
+        (LT::Json, V::Json(_)) => true,
+        (LT::Blob, V::Blob(_)) => true,
+        (LT::Node, V::Node(_)) => true,
+        (LT::Rel, V::Rel(_)) => true,
+        (LT::RecursiveRel, V::RecursiveRel { .. }) => true,
+        (LT::UUID, V::UUID(_)) => true,
+        // Nested types: recursive structural match
+        (LT::List { child_type: declared }, V::List(actual, items)) => {
+            // The declared child type should match the actual type stored in the List variant
+            if declared != actual {
+                return false;
+            }
+            // Validate each element against the child type
+            items.iter().all(|v| value_matches_logical_type(v, declared))
+        }
+        (LT::Array { child_type: declared, .. }, V::Array(actual, items)) => {
+            if declared != actual {
+                return false;
+            }
+            items.iter().all(|v| value_matches_logical_type(v, declared))
+        }
+        (LT::Struct { fields: declared }, V::Struct(actual)) => {
+            declared.len() == actual.len()
+                && declared.iter().zip(actual.iter()).all(|((name_decl, typ_decl), (name_act, val_act))| {
+                    name_decl == name_act && value_matches_logical_type(val_act, typ_decl)
+                })
+        }
+        (LT::Map { key_type, value_type }, V::Map(_, items)) => {
+            items.iter().all(|(k, v)| {
+                value_matches_logical_type(k, key_type) && value_matches_logical_type(v, value_type)
+            })
+        }
+        (LT::Decimal { .. }, V::Decimal(_)) => true,
+        // Serial has no direct Value variant
+        _ => false,
+    }
+}
+
+impl Value {
+    /// Creates a new `List` value with type validation.
+    ///
+    /// Returns an error if any element's type does not match the declared `LogicalType`.
+    pub fn new_list(list_type: LogicalType, items: Vec<Value>) -> Result<Self, crate::error::Error> {
+        for item in &items {
+            if !value_matches_logical_type(item, &list_type) {
+                return Err(crate::error::Error::UnsupportedType(format!(
+                    "List element type mismatch: expected {list_type:?}, got {:?}",
+                    LogicalType::from(item),
+                )));
+            }
+        }
+        Ok(Value::List(list_type, items))
+    }
 }
 
 fn display_list<T: std::fmt::Display>(f: &mut fmt::Formatter<'_>, list: &[T]) -> fmt::Result {
@@ -688,8 +776,7 @@ impl TryFrom<&ffi::Value> for Value {
                     unreachable!()
                 }
             }
-            // TODO(bmwinger): Better error message for types which are unsupported
-            x => panic!("Unsupported type {x:?}"),
+            x => Err(ConversionError::UnsupportedType(format!("{x:?}"))),
         }
     }
 }
@@ -1064,7 +1151,10 @@ mod tests {
                     .query("MATCH (a:Person) WHERE a.name = \"Bob\" RETURN a.item;")?
                     .next()
                     .unwrap();
-                // TODO: Test equivalence to value constructed inside a a query
+                // TODO: Also test equivalence for values constructed entirely inside a Cypher query
+                // (not passed through Rust). For example: `RETURN 42` should produce Value::Int64(42).
+                // This is partially covered by the round-trip above (Rust→Cypher→Rust), but a true
+                // Cypher→Rust test requires per-type Cypher syntax in the macro invocation.
                 assert_eq!(result[0], $value);
                 temp_dir.close()?;
                 Ok(())

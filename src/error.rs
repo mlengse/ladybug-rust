@@ -12,6 +12,8 @@ pub enum Error {
     ReadOnlyType(LogicalType),
     /// Message produced when JSON serialization fails
     JsonError(serde_json::Error),
+    /// Message produced when an unsupported type is encountered during FFI conversion
+    UnsupportedType(String),
     #[cfg(feature = "arrow")]
     ArrowError(arrow::error::ArrowError),
 }
@@ -26,6 +28,9 @@ impl std::fmt::Display for Error {
             }
             Error::ReadOnlyType(typ) => {
                 write!(f, "Attempted to pass read only type {typ:?} over ffi!")
+            }
+            Error::UnsupportedType(typ) => {
+                write!(f, "Unsupported type encountered during FFI conversion: {typ}")
             }
             Error::JsonError(err) => write!(f, "{err}"),
             #[cfg(feature = "arrow")]

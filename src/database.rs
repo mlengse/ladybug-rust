@@ -2,6 +2,7 @@ use cxx::UniquePtr;
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::path::Path;
+use std::pin::Pin;
 
 use crate::error::Error;
 use crate::ffi::ffi;
@@ -11,7 +12,10 @@ pub struct Database {
     pub(crate) db: UnsafeCell<UniquePtr<ffi::Database>>,
 }
 
+// SAFETY: The C++ Database is internally synchronized via a mutex, so it is safe to
+// move and share across threads even though the Rust wrapper uses UnsafeCell.
 unsafe impl Send for Database {}
+// SAFETY: Same rationale as Send — the C++ Database is internally synchronized.
 unsafe impl Sync for Database {}
 
 #[derive(Clone, Debug)]
@@ -128,6 +132,15 @@ impl SystemConfig {
 pub(crate) const IN_MEMORY_DB_NAME: &str = ":memory:";
 
 impl Database {
+    /// Returns a pinned mutable reference to the underlying C++ Database.
+    ///
+    /// # Safety
+    /// The C++ Database is internally synchronized, so producing
+    /// multiple `Pin<&mut ...>` references from shared `&self` access is sound.
+    pub(crate) fn db_pin_mut(&self) -> Pin<&mut ffi::Database> {
+        unsafe { (*self.db.get()).pin_mut() }
+    }
+
     /// Creates a database object
     ///
     /// # Arguments:

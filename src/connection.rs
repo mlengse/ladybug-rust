@@ -6,6 +6,7 @@ use crate::value::Value;
 use cxx::UniquePtr;
 use std::cell::UnsafeCell;
 use std::convert::TryInto;
+use std::pin::Pin;
 
 #[cfg(feature = "arrow")]
 fn export_arrow_batches(
@@ -116,7 +117,10 @@ pub struct Connection<'a> {
 
 // Connections are synchronized on the C++ side and should be safe to move and access across
 // threads
+// SAFETY: The C++ Connection internally uses a std::mutex for all operations,
+// so concurrent mutable access via `Pin<&mut ...>` from shared `&self` references is sound.
 unsafe impl Send for Connection<'_> {}
+// SAFETY: Same rationale as Send — the C++ Connection is internally synchronized.
 unsafe impl Sync for Connection<'_> {}
 
 impl<'a> Connection<'a> {
@@ -125,7 +129,7 @@ impl<'a> Connection<'a> {
     /// # Arguments
     /// * `database`: A reference to the database instance to which this connection will be connected.
     pub fn new(database: &'a Database) -> Result<Self, Error> {
-        let db = unsafe { (*database.db.get()).pin_mut() };
+        let db = database.db_pin_mut();
         Ok(Connection {
             conn: UnsafeCell::new(ffi::database_connect(db)?),
         })
@@ -139,9 +143,18 @@ impl<'a> Connection<'a> {
         ffi::connection_set_max_num_thread_for_exec(self.conn.get_mut().pin_mut(), num_threads);
     }
 
+    /// Returns a pinned mutable reference to the underlying C++ Connection.
+    ///
+    /// # Safety
+    /// The C++ Connection is internally synchronized via a mutex, so producing
+    /// multiple `Pin<&mut ...>` references from shared `&self` access is sound.
+    fn conn_pin_mut(&self) -> Pin<&mut ffi::Connection<'a>> {
+        unsafe { (*self.conn.get()).pin_mut() }
+    }
+
     /// Returns the maximum number of threads used for execution in the current connection
     pub fn get_max_num_threads_for_exec(&self) -> u64 {
-        ffi::connection_get_max_num_thread_for_exec(unsafe { (*self.conn.get()).pin_mut() })
+        ffi::connection_get_max_num_thread_for_exec(self.conn_pin_mut())
     }
 
     /// Prepares the given query and returns the prepared statement. [`PreparedStatement`]s can be run
@@ -152,7 +165,7 @@ impl<'a> Connection<'a> {
     ///   query format.
     pub fn prepare(&self, query: &str) -> Result<PreparedStatement, Error> {
         let statement = ffi::connection_prepare(
-            unsafe { (*self.conn.get()).pin_mut() },
+            self.conn_pin_mut(),
             ffi::StringView::new(query),
         )?;
         if ffi::prepared_statement_is_success(&statement) {
@@ -169,16 +182,10 @@ impl<'a> Connection<'a> {
     /// # Arguments
     /// * `query`: The query to execute. See <https://ladybugdb.com/docs/cypher> for details on the
     ///   query format.
-    // TODO(bmwinger): Instead of having a Value enum in the results, perhaps QueryResult, and thus query
-    // should be generic.
-    //
-    // E.g.
-    // let result: QueryResult<lbug::value::List<lbug::value::String>> = conn.query("...")?;
-    // let result: QueryResult<lbug::value::Int64> = conn.query("...")?;
-    //
-    // But this would really just be syntactic sugar wrapping the current system
+    // TODO(bmwinger): Consider making QueryResult<T> generic for compile-time type safety.
+    // Deferred — see https://github.com/lbugdb/lbug/issues (future tracking issue).
     pub fn query(&self, query: &str) -> Result<QueryResult<'a>, Error> {
-        let conn = unsafe { (*self.conn.get()).pin_mut() };
+        let conn = self.conn_pin_mut();
         let result = ffi::connection_query(conn, ffi::StringView::new(query))?;
         Self::query_result_from_ffi(result)
     }
@@ -203,7 +210,7 @@ impl<'a> Connection<'a> {
     ///
     /// *Requires the `arrow` feature*
     pub fn query_as_arrow(&self, query: &str, chunk_size: usize) -> Result<QueryResult<'a>, Error> {
-        let conn = unsafe { (*self.conn.get()).pin_mut() };
+        let conn = self.conn_pin_mut();
         let result = crate::ffi::arrow::ffi_arrow::connection_query_as_arrow(
             conn,
             ffi::StringView::new(query),
@@ -224,7 +231,7 @@ impl<'a> Connection<'a> {
         batches: &[arrow::record_batch::RecordBatch],
     ) -> Result<QueryResult<'a>, Error> {
         let (schema, arrays) = export_arrow_batches(batches)?;
-        let conn = unsafe { (*self.conn.get()).pin_mut() };
+        let conn = self.conn_pin_mut();
         let result = crate::ffi::arrow::ffi_arrow::connection_create_arrow_table(
             conn,
             ffi::StringView::new(table_name),
@@ -248,7 +255,7 @@ impl<'a> Connection<'a> {
         dst_table_name: &str,
     ) -> Result<QueryResult<'a>, Error> {
         let (schema, arrays) = export_arrow_batches(batches)?;
-        let conn = unsafe { (*self.conn.get()).pin_mut() };
+        let conn = self.conn_pin_mut();
         let result = crate::ffi::arrow::ffi_arrow::connection_create_arrow_rel_table(
             conn,
             ffi::StringView::new(table_name),
@@ -278,7 +285,7 @@ impl<'a> Connection<'a> {
     ) -> Result<QueryResult<'a>, Error> {
         let (indices_schema, indices_arrays) = export_arrow_batches(indices_batches)?;
         let (indptr_schema, indptr_arrays) = export_arrow_batches(indptr_batches)?;
-        let conn = unsafe { (*self.conn.get()).pin_mut() };
+        let conn = self.conn_pin_mut();
         let result = crate::ffi::arrow::ffi_arrow::connection_create_arrow_rel_table_csr(
             conn,
             ffi::StringView::new(table_name),
@@ -298,7 +305,7 @@ impl<'a> Connection<'a> {
     ///
     /// *Requires the `arrow` feature*
     pub fn drop_arrow_table(&self, table_name: &str) -> Result<QueryResult<'a>, Error> {
-        let conn = unsafe { (*self.conn.get()).pin_mut() };
+        let conn = self.conn_pin_mut();
         let result = crate::ffi::arrow::ffi_arrow::connection_drop_arrow_table(
             conn,
             ffi::StringView::new(table_name),
@@ -342,7 +349,7 @@ impl<'a> Connection<'a> {
             let ffi_value: cxx::UniquePtr<ffi::Value> = value.try_into()?;
             ffi::query_params_insert(cxx_params.pin_mut(), key, ffi_value);
         }
-        let conn = unsafe { (*self.conn.get()).pin_mut() };
+        let conn = self.conn_pin_mut();
         let result =
             ffi::connection_execute(conn, prepared_statement.statement.pin_mut(), cxx_params)?;
         Self::query_result_from_ffi(result)
@@ -350,7 +357,7 @@ impl<'a> Connection<'a> {
 
     /// Interrupts all queries currently executing within this connection
     pub fn interrupt(&self) -> Result<(), Error> {
-        let conn = unsafe { (*self.conn.get()).pin_mut() };
+        let conn = self.conn_pin_mut();
         Ok(ffi::connection_interrupt(conn)?)
     }
 
@@ -358,7 +365,7 @@ impl<'a> Connection<'a> {
     ///
     /// A value of zero (the default) disables the timeout.
     pub fn set_query_timeout(&self, timeout_ms: u64) {
-        let conn = unsafe { (*self.conn.get()).pin_mut() };
+        let conn = self.conn_pin_mut();
         ffi::connection_set_query_timeout(conn, timeout_ms);
     }
 }

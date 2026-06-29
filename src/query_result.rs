@@ -10,7 +10,9 @@ pub struct QueryResult<'a> {
     pub(crate) result: UniquePtr<ffi::QueryResult<'a>>,
 }
 
-// Should be safe to move across threads, however access is not synchronized
+// SAFETY: The C++ QueryResult holds no non-Send state (it owns plain C++ data with no
+// thread-local or non-Send resources). Access is not synchronized, but moving across
+// threads is safe.
 unsafe impl Send for ffi::QueryResult<'_> {}
 
 /// Options for writing CSV files
@@ -129,6 +131,9 @@ impl<'db> QueryResult<'db> {
         fn import_i64_array(
             array: crate::ffi::arrow::ArrowArray,
         ) -> Result<Int64Array, crate::error::Error> {
+            // SAFETY: The C++ ArrowArray is guaranteed valid by the C++ side.
+            // `from_ffi_and_data_type` assumes the FFI data is correctly constructed with the
+            // given type, which holds because the C++ Arrow converter always produces valid data.
             let data = unsafe { arrow::ffi::from_ffi_and_data_type(array.0, DataType::Int64) }?;
             Ok(Int64Array::from(data))
         }
@@ -153,6 +158,24 @@ impl<'db> QueryResult<'db> {
             edge_ids,
         })
     }
+
+    /// Fallible variant of the iterator — returns `Result` instead of panicking on type mismatch.
+    ///
+    /// Call this instead of `.next()` when you want to handle conversion errors gracefully
+    /// instead of unwrapping.
+    pub fn next_result(&mut self) -> Option<Result<Vec<Value>, crate::error::Error>> {
+        if ffi::query_result_has_next(self.result.as_ref().unwrap()) {
+            let flat_tuple = ffi::query_result_get_next(self.result.pin_mut());
+            let mut result = vec![];
+            for i in 0..ffi::flat_tuple_len(flat_tuple.as_ref().unwrap()) {
+                let value = ffi::flat_tuple_get_value(flat_tuple.as_ref().unwrap(), i);
+                result.push(value.try_into()?);
+            }
+            Some(Ok(result))
+        } else {
+            None
+        }
+    }
 }
 
 // the underlying C++ type is both data and an iterator (sort-of)
@@ -160,22 +183,9 @@ impl Iterator for QueryResult<'_> {
     type Item = Vec<Value>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if ffi::query_result_has_next(self.result.as_ref().unwrap()) {
-            let flat_tuple = ffi::query_result_get_next(self.result.pin_mut());
-            let mut result = vec![];
-            for i in 0..ffi::flat_tuple_len(flat_tuple.as_ref().unwrap()) {
-                let value = ffi::flat_tuple_get_value(flat_tuple.as_ref().unwrap(), i);
-                // TODO: Return result instead of unwrapping?
-                // Unfortunately, as an iterator, this would require producing
-                // Vec<Result<Value>>, though it would be possible to turn that into
-                // Result<Vec<Value>> instead, but it would lose information when multiple failures
-                // occur.
-                result.push(value.try_into().unwrap());
-            }
-            Some(result)
-        } else {
-            None
-        }
+        self.next_result().map(|r| r.unwrap_or_else(|e| {
+            panic!("Value conversion error in QueryResult iterator: {e}")
+        }))
     }
 }
 
@@ -216,6 +226,9 @@ impl Iterator for ArrowIterator<'_, '_> {
                 self.chunk_size as u64,
             )
             .expect("Failed to get next recordbatch");
+            // SAFETY: The C++ ArrowArray and ArrowSchema are guaranteed valid by the C++ side.
+            // `from_ffi` assumes the FFI data is correctly constructed, which holds because
+            // the C++ Arrow converter always produces valid data matching the schema.
             let struct_array: arrow::array::StructArray =
                 unsafe { arrow::ffi::from_ffi(array.0, &self.schema) }
                     .expect("Failed to convert ArrowArray from C data")
