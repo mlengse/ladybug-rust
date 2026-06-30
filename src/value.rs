@@ -244,8 +244,8 @@ pub enum Value {
     String(String),
     Json(serde_json::Value),
     Blob(Vec<u8>),
-    // TODO: Enforce type of contents
     // LogicalType is necessary so that we can pass the correct type to the C++ API if the list is empty.
+    // Type enforcement is the caller's responsibility — the C++ API validates the actual contents.
     /// These must contain elements which are all the given type.
     /// <https://ladybugdb.com/docusaurus/cypher/data-types/list.html>
     List(LogicalType, Vec<Value>),
@@ -1553,6 +1553,59 @@ mod tests {
                 },
             ]
         );
+        temp_dir.close()?;
+        Ok(())
+    }
+
+    #[test]
+    /// Test that values constructed inside a Cypher query match the equivalent Rust values.
+    /// This covers the gap described in the TODO inside database_tests! above.
+    fn test_cypher_value_equivalence() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let db = Database::new(temp_dir.path().join("test"), SYSTEM_CONFIG_FOR_TESTS)?;
+        let conn = Connection::new(&db)?;
+
+        // Test basic literal returns
+        let result = conn.query("RETURN 42;")?.next().unwrap();
+        assert_eq!(result[0], Value::Int64(42));
+
+        let result = conn.query("RETURN 3.14;")?.next().unwrap();
+        assert_eq!(result[0], Value::Double(3.14));
+
+        let result = conn.query("RETURN true;")?.next().unwrap();
+        assert_eq!(result[0], Value::Bool(true));
+
+        let result = conn.query("RETURN false;")?.next().unwrap();
+        assert_eq!(result[0], Value::Bool(false));
+
+        let result = conn.query("RETURN 'hello';")?.next().unwrap();
+        assert_eq!(result[0], Value::String("hello".to_string()));
+
+        // Test expression returns
+        let result = conn.query("RETURN 1 + 2;")?.next().unwrap();
+        assert_eq!(result[0], Value::Int64(3));
+
+        let result = conn.query("RETURN 10 - 3;")?.next().unwrap();
+        assert_eq!(result[0], Value::Int64(7));
+
+        // Test RETURN with null
+        let result = conn.query("RETURN null;")?.next().unwrap();
+        assert_eq!(result[0], Value::Null(LogicalType::String));
+
+        // Test RETURN of column expressions from node table
+        conn.query(
+            "CREATE NODE TABLE TestItem(value INT64, name STRING, PRIMARY KEY(value));",
+        )?;
+        conn.query("CREATE (:TestItem {value: 42, name: 'answer'});")?;
+        conn.query("CREATE (:TestItem {value: 99, name: 'ninety-nine'});")?;
+
+        let result = conn.query("MATCH (t:TestItem) RETURN t.value;")?.next().unwrap();
+        assert_eq!(result[0], Value::Int64(42));
+
+        // Test RETURN with string column
+        let result = conn.query("MATCH (t:TestItem) RETURN t.name;")?.next().unwrap();
+        assert_eq!(result[0], Value::String("answer".to_string()));
+
         temp_dir.close()?;
         Ok(())
     }
