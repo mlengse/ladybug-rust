@@ -1151,10 +1151,9 @@ mod tests {
                     .query("MATCH (a:Person) WHERE a.name = \"Bob\" RETURN a.item;")?
                     .next()
                     .unwrap();
-                // TODO: Also test equivalence for values constructed entirely inside a Cypher query
-                // (not passed through Rust). For example: `RETURN 42` should produce Value::Int64(42).
-                // This is partially covered by the round-trip above (Rust→Cypher→Rust), but a true
-                // Cypher→Rust test requires per-type Cypher syntax in the macro invocation.
+                // Cypher→Rust value equivalence is tested by `test_cypher_value_equivalence` below.
+                // This covers: `RETURN 42` → `Value::Int64(42)`, `RETURN 'hello'` → `Value::String`,
+                // arithmetic expressions, null, and column fetch from node tables.
                 assert_eq!(result[0], $value);
                 temp_dir.close()?;
                 Ok(())
